@@ -1,0 +1,22 @@
+# Secrets & data NEVER go to Git (guide s16). Code only.
+.env
+data/
+logs/
+venv/
+setup/server_data/
+
+# Personal / internal docs -- never go to the public repo (same call as the bus
+# repo untracking CLAUDE.md / implementation.md). Only README.md is public-facing.
+remote_host_architecture_guideLAST.md
+IMPLEMENTATION_PLAN.md
+BOT_SPEC.md
+ROUTINE.md
+
+# Python
+__pycache__/
+*.py[cod]
+*.egg-info/
+.pytest_cache/
+*.db
+*.db-wal
+*.db-shm
