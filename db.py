@@ -11,6 +11,7 @@ across PTB's event loop + JobQueue callbacks. WAL mode is enabled for durability
 
 from __future__ import annotations
 
+import json
 import sqlite3
 from contextlib import contextmanager
 from datetime import date, datetime, timedelta
@@ -82,6 +83,8 @@ def init_db() -> None:
             """
         )
 
+        _migrate(conn)
+
         # Seed the single streak row.
         conn.execute(
             "INSERT OR IGNORE INTO streak (id, current, longest) VALUES (1, 0, 0)"
@@ -91,6 +94,7 @@ def init_db() -> None:
         defaults = {
             "new_cards_per_day": str(config.DEFAULT_NEW_CARDS_PER_DAY),
             "push_morning": config.DEFAULT_MORNING_PUSH,
+            "push_midday": config.DEFAULT_MIDDAY_PUSH,
             "push_evening": config.DEFAULT_EVENING_PUSH,
             "push_tz": config.PUSH_TZ_NAME,
         }
@@ -110,6 +114,34 @@ def init_db() -> None:
                     "INSERT INTO schedule (weekday, is_lesson_day, time) VALUES (?, ?, ?)",
                     (wd, is_lesson, time_val),
                 )
+
+
+def _migrate(conn: sqlite3.Connection) -> None:
+    """Additive, idempotent schema upgrades for features added after v1.
+
+    SQLite has no 'ADD COLUMN IF NOT EXISTS', so we check PRAGMA first. Every
+    change here must be safe to run on every boot and must never drop data --
+    the DB is the irreplaceable SRS history (guide s13).
+    """
+    cols = {r["name"] for r in conn.execute("PRAGMA table_info(cards)")}
+    if "enrich_json" not in cols:
+        # Cached active-recall metadata for a card: {word, clue_en, cloze, answer}.
+        # Generated lazily by Gemini the first time a card needs a typed mode.
+        conn.execute("ALTER TABLE cards ADD COLUMN enrich_json TEXT")
+
+    conn.executescript(
+        """
+        CREATE TABLE IF NOT EXISTS mistakes (
+            id         INTEGER PRIMARY KEY AUTOINCREMENT,
+            category   TEXT NOT NULL,     -- one of recall.CATEGORIES
+            detail     TEXT,              -- the corrected form / short note
+            source     TEXT,              -- writing | lesson | drill | review
+            created_at TEXT NOT NULL      -- ISO datetime
+        );
+        CREATE INDEX IF NOT EXISTS idx_mistakes_created ON mistakes (created_at);
+        CREATE INDEX IF NOT EXISTS idx_mistakes_cat ON mistakes (category);
+        """
+    )
 
 
 # --- settings ------------------------------------------------------------------
@@ -148,6 +180,16 @@ def _row_to_card(row: sqlite3.Row) -> dict:
             card["due_date"] = date.fromisoformat(card["due_date"])
         except ValueError:
             card["due_date"] = None
+    raw = card.pop("enrich_json", None)
+    enrich = None
+    if raw:
+        try:
+            parsed = json.loads(raw)
+            if isinstance(parsed, dict):
+                enrich = parsed
+        except (json.JSONDecodeError, TypeError):
+            enrich = None
+    card["enrich"] = enrich
     return card
 
 
@@ -263,6 +305,73 @@ def update_card_srs(
             "due_date = ? WHERE id = ?",
             (interval, ease_factor, repetitions, due_date.isoformat(), card_id),
         )
+
+
+# --- active-recall enrichment cache --------------------------------------------
+
+def set_card_enrichment(card_id: int, enrich: dict) -> None:
+    """Cache Gemini-derived recall metadata ({word, clue_en, cloze, answer})."""
+    with _connect() as conn:
+        conn.execute(
+            "UPDATE cards SET enrich_json = ? WHERE id = ?",
+            (json.dumps(enrich, ensure_ascii=False), card_id),
+        )
+
+
+def random_distractor_backs(exclude_card_id: int, limit: int = 12) -> list[str]:
+    """Random other cards' backs, to build multiple-choice distractors.
+
+    Returns raw backs (the caller cleans them with recall.clean_english); pulls a
+    few extra so the caller can drop ones that collide with the right answer.
+    """
+    with _connect() as conn:
+        rows = conn.execute(
+            "SELECT back FROM cards WHERE id != ? ORDER BY RANDOM() LIMIT ?",
+            (exclude_card_id, limit),
+        ).fetchall()
+    return [r["back"] for r in rows]
+
+
+# --- mistake-pattern engine ----------------------------------------------------
+
+def log_mistake(category: str, detail: str = "", source: str = "", *, when: Optional[datetime] = None) -> None:
+    """Record one categorised mistake. Powers /mistakes and 'drill my worst'."""
+    ts = (when or datetime.now()).isoformat(timespec="seconds")
+    with _connect() as conn:
+        conn.execute(
+            "INSERT INTO mistakes (category, detail, source, created_at) VALUES (?, ?, ?, ?)",
+            (category, (detail or "")[:500], source, ts),
+        )
+
+
+def top_mistake_categories(since: Optional[datetime] = None, limit: int = 5) -> list[dict]:
+    """Most frequent mistake categories since `since` (default: all time)."""
+    sql = "SELECT category, COUNT(*) AS n FROM mistakes"
+    params: tuple = ()
+    if since is not None:
+        sql += " WHERE created_at >= ?"
+        params = (since.isoformat(timespec="seconds"),)
+    sql += " GROUP BY category ORDER BY n DESC, category ASC LIMIT ?"
+    params += (limit,)
+    with _connect() as conn:
+        rows = conn.execute(sql, params).fetchall()
+    return [{"category": r["category"], "count": r["n"]} for r in rows]
+
+
+def worst_mistake_category(since: Optional[datetime] = None) -> Optional[str]:
+    top = top_mistake_categories(since=since, limit=1)
+    return top[0]["category"] if top else None
+
+
+def count_mistakes(since: Optional[datetime] = None) -> int:
+    sql = "SELECT COUNT(*) AS n FROM mistakes"
+    params: tuple = ()
+    if since is not None:
+        sql += " WHERE created_at >= ?"
+        params = (since.isoformat(timespec="seconds"),)
+    with _connect() as conn:
+        row = conn.execute(sql, params).fetchone()
+    return row["n"]
 
 
 # --- schedule ------------------------------------------------------------------

@@ -20,6 +20,7 @@ from logging.handlers import RotatingFileHandler
 from telegram import Update
 from telegram.ext import (
     Application,
+    CallbackQueryHandler,
     CommandHandler,
     ContextTypes,
     MessageHandler,
@@ -31,7 +32,7 @@ import db
 import scheduler
 import seedloader
 from auth import owner_only
-from flows import lesson, review
+from flows import drills, grammar, learn, lesson, mistakes, review
 from flows import schedule as schedule_flow
 from flows import writing
 
@@ -102,16 +103,23 @@ def setup_logging() -> None:
 HELP_TEXT = (
     "*German tutor bot* \U0001f1e9\U0001f1ea\n\n"
     "Your single daily home for German. Commands:\n"
-    "• /review — spaced-repetition cards (due + new)\n"
+    "• /review — spaced-repetition cards, mixed recall modes (add `easy` for a bad day)\n"
+    "• /learn — get taught new words (meaning + example), then bank them\n"
     "• /write — a writing prompt, then AI correction\n"
     "• /lesson — paste lesson notes → flashcards\n"
+    "• /grammar — quick drills on today's grammar point\n"
+    "• /mistakes — your top mistake types + drill your worst\n"
     "• /schedule — set which days are lesson days\n"
     "• /today — today's plan\n"
     "• /stats — streak & deck size\n"
     "• /seed — import the Goethe B1 starter deck\n"
     "• /backup — DM yourself a copy of the SRS database\n"
     "• /cancel — abort the current step\n\n"
-    "Daily push: morning plan + evening check-in (Cyprus time).\n"
+    "Daily pushes: morning plan, a midday nudge if cards pile up, and an evening "
+    "check-in (Cyprus time) — each with one-tap buttons.\n\n"
+    "*Rating a card:* after you see the answer, tap *Again / Hard / Good / Easy* — "
+    "the time on each button is when you'll see that card next (so Easy pushes it "
+    "furthest out). Be honest; that's what tunes the spacing.\n\n"
     "Rule of thumb: *produce first, AI checks after.* A bad day = Core only "
     "still keeps the streak."
 )
@@ -192,8 +200,12 @@ async def cmd_seed(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
 
 @owner_only
 async def cmd_cancel(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
-    had = context.user_data.pop("await", None)
-    context.user_data.pop("review", None)
+    # Clear every in-progress flow state, including a button-only /learn session
+    # (which has no "await" key), and report accurately whether anything was live.
+    had = False
+    for key in ("await", "review", "drill", "learn"):
+        if context.user_data.pop(key, None) is not None:
+            had = True
     await update.effective_message.reply_text(
         "Cancelled." if had else "Nothing to cancel."
     )
@@ -215,9 +227,51 @@ async def on_text(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
         await lesson.handle_text(update, context)
     elif kind == "time":
         await schedule_flow.apply_time_text(update, context, state["weekday"])
+    elif kind == "review_answer":
+        await review.handle_answer(update, context)
+    elif kind == "drill_answer":
+        await drills.handle_answer(update, context)
     else:
         context.user_data.pop("await", None)
         await update.effective_message.reply_text("Lost track of that — try again.")
+
+
+@owner_only
+async def on_go(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    """Dispatch a push-notification button (callback 'go:<action>') to a command.
+
+    Lives here, not in scheduler.py, because the entrypoint already imports every
+    flow -- keeping scheduler import-cycle-free (flows.grammar imports scheduler).
+    """
+    query = update.callback_query
+    action = query.data.split(":")[1]
+    await query.answer()
+
+    # Telegram omits the message body for callbacks on pushes older than ~48h; the
+    # inner commands all rely on update.effective_message.reply_text, so fall back
+    # to a fresh DM rather than crashing on a None message.
+    if update.effective_message is None:
+        uid = update.effective_user.id if update.effective_user else None
+        if uid is not None:
+            await context.bot.send_message(uid, "That button expired — just send the command, e.g. /review.")
+        return
+
+    # Drop the tapped button so a stale tap can't launch the same thing twice.
+    try:
+        await query.edit_message_reply_markup(reply_markup=None)
+    except Exception:  # noqa: BLE001 - keyboard may already be gone
+        pass
+
+    if action == "review":
+        await review.cmd_review(update, context)
+    elif action == "learn":
+        await learn.cmd_learn(update, context)
+    elif action == "write":
+        await writing.cmd_write(update, context)
+    elif action == "grammar":
+        await grammar.cmd_grammar(update, context)
+    elif action == "today":
+        await cmd_today(update, context)
 
 
 async def on_error(update: object, context: ContextTypes.DEFAULT_TYPE) -> None:
@@ -237,9 +291,12 @@ async def post_init(application: Application) -> None:
     try:
         await application.bot.set_my_commands(
             [
-                ("review", "Review due + new cards"),
+                ("review", "Review cards (mixed recall modes)"),
+                ("learn", "Learn new words (guided intake)"),
                 ("write", "Writing prompt + AI correction"),
                 ("lesson", "Bank a lesson into cards"),
+                ("grammar", "Drill today's grammar point"),
+                ("mistakes", "Your mistake patterns + drills"),
                 ("schedule", "View/edit lesson days"),
                 ("today", "Today's plan"),
                 ("stats", "Streak & deck stats"),
@@ -266,12 +323,23 @@ def build_application() -> Application:
 
     for handler in review.handlers():
         application.add_handler(handler)
+    for handler in learn.handlers():
+        application.add_handler(handler)
     for handler in writing.handlers():
         application.add_handler(handler)
     for handler in lesson.handlers():
         application.add_handler(handler)
     for handler in schedule_flow.handlers():
         application.add_handler(handler)
+    for handler in grammar.handlers():
+        application.add_handler(handler)
+    for handler in mistakes.handlers():
+        application.add_handler(handler)
+    for handler in drills.handlers():
+        application.add_handler(handler)
+
+    # Push-notification tap-to-start buttons (callback data 'go:<action>').
+    application.add_handler(CallbackQueryHandler(on_go, pattern=r"^go:"))
 
     # Catch-all free text (must come after command handlers).
     application.add_handler(

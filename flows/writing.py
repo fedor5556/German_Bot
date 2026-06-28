@@ -112,6 +112,9 @@ async def handle_text(update: Update, context: ContextTypes.DEFAULT_TYPE, target
     added = 0
     if mistakes:
         added = db.add_cards([(m["front"], m["back"]) for m in mistakes], source="writing")
+        # Feed the mistake-pattern engine: one logged mistake per correction.
+        for m in mistakes:
+            db.log_mistake(m.get("category", "Other"), m.get("front", ""), source="writing")
 
     # Plain text: corrected German / explanation are AI-generated and may contain
     # Markdown metacharacters.

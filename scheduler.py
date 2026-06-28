@@ -16,6 +16,7 @@ import tempfile
 from datetime import date, datetime, time as dtime
 from pathlib import Path
 
+from telegram import InlineKeyboardButton, InlineKeyboardMarkup
 from telegram.ext import Application, ContextTypes
 
 import config
@@ -90,11 +91,35 @@ def _morning_message(day: date) -> str:
     else:  # FULL
         body = (
             "*Full study day.*\n"
-            "1. /review due + new cards (Core).\n"
-            f"2. Grammar focus: *{grammar_point_for(day)}*.\n"
+            "1. /review due cards, then /learn a few new words (Core).\n"
+            f"2. Grammar focus: *{grammar_point_for(day)}* — /grammar for quick drills.\n"
             "3. /write a short paragraph using today's grammar + new words."
         )
     return head + "\n\n" + body
+
+
+# Tap-to-start buttons. The "go:" callbacks are dispatched in german_bot.py
+# (which already imports every flow) so this module needs no flow imports and
+# stays free of an import cycle (flows.grammar imports scheduler).
+_BTN_REVIEW = InlineKeyboardButton("\U0001f4da Review", callback_data="go:review")
+_BTN_LEARN = InlineKeyboardButton("\U0001f4d6 Learn new", callback_data="go:learn")
+_BTN_WRITE = InlineKeyboardButton("✍️ Write", callback_data="go:write")
+_BTN_GRAMMAR = InlineKeyboardButton("\U0001f9e9 Grammar", callback_data="go:grammar")
+
+
+def _morning_keyboard(day: date) -> InlineKeyboardMarkup:
+    """One-tap entry points, tuned to the day type so a notification leads to action."""
+    day_type = sched.resolve_for(day)
+    rows = [[_BTN_REVIEW, _BTN_LEARN]]
+    if day_type == sched.FULL:
+        rows.append([_BTN_WRITE, _BTN_GRAMMAR])
+    else:  # lesson day or Sunday review -- keep it lighter
+        rows.append([_BTN_WRITE])
+    return InlineKeyboardMarkup(rows)
+
+
+def _evening_keyboard() -> InlineKeyboardMarkup:
+    return InlineKeyboardMarkup([[_BTN_REVIEW, _BTN_WRITE]])
 
 
 def _evening_message() -> str:
@@ -120,14 +145,37 @@ async def morning_push(context: ContextTypes.DEFAULT_TYPE) -> None:
     if chat_id is None:
         log.warning("morning_push: no owner chat id known yet")
         return
-    await context.bot.send_message(chat_id, _morning_message(date.today()), parse_mode="Markdown")
+    day = date.today()
+    await context.bot.send_message(
+        chat_id, _morning_message(day), parse_mode="Markdown", reply_markup=_morning_keyboard(day)
+    )
 
 
 async def evening_push(context: ContextTypes.DEFAULT_TYPE) -> None:
     chat_id = _owner_chat_id()
     if chat_id is None:
         return
-    await context.bot.send_message(chat_id, _evening_message(), parse_mode="Markdown")
+    await context.bot.send_message(
+        chat_id, _evening_message(), parse_mode="Markdown", reply_markup=_evening_keyboard()
+    )
+
+
+async def midday_push(context: ContextTypes.DEFAULT_TYPE) -> None:
+    """A gentle nudge -- only fires when there's still work AND you haven't studied today."""
+    chat_id = _owner_chat_id()
+    if chat_id is None:
+        return
+    today = date.today()
+    already_done = db.get_streak().get("last_active_date") == today.isoformat()
+    due = db.count_due(today)
+    if already_done or due == 0:
+        return  # nothing to nag about -- stay quiet
+    kb = InlineKeyboardMarkup([[_BTN_REVIEW, _BTN_LEARN]])
+    await context.bot.send_message(
+        chat_id,
+        f"⏰ Midday check — {due} card(s) still due. A quick set keeps today's streak alive.",
+        reply_markup=kb,
+    )
 
 
 async def daily_cleanup(context: ContextTypes.DEFAULT_TYPE) -> None:
@@ -169,14 +217,19 @@ def register_jobs(application: Application) -> None:
         log.error("JobQueue is not available -- install python-telegram-bot[job-queue]")
         return
 
-    for name in ("morning", "evening", "daily_cleanup", "weekly_backup"):
+    for name in ("morning", "midday", "evening", "daily_cleanup", "weekly_backup"):
         for job in jq.get_jobs_by_name(name):
             job.schedule_removal()
 
     morning = _parse_hhmm(db.get_setting("push_morning"), config.DEFAULT_MORNING_PUSH)
+    midday = _parse_hhmm(db.get_setting("push_midday"), config.DEFAULT_MIDDAY_PUSH)
     evening = _parse_hhmm(db.get_setting("push_evening"), config.DEFAULT_EVENING_PUSH)
     jq.run_daily(morning_push, time=morning, name="morning")
+    jq.run_daily(midday_push, time=midday, name="midday")
     jq.run_daily(evening_push, time=evening, name="evening")
     jq.run_daily(daily_cleanup, time=dtime(0, 5, tzinfo=config.PUSH_TZ), name="daily_cleanup")
     jq.run_daily(weekly_backup, time=dtime(8, 0, tzinfo=config.PUSH_TZ), name="weekly_backup")
-    log.info("Registered daily jobs: morning %s, evening %s (%s)", morning, evening, config.PUSH_TZ_NAME)
+    log.info(
+        "Registered daily jobs: morning %s, midday %s, evening %s (%s)",
+        morning, midday, evening, config.PUSH_TZ_NAME,
+    )

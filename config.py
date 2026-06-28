@@ -64,6 +64,7 @@ GEMINI_MODEL = os.getenv("GEMINI_MODEL", "gemini-3.5-flash").strip() or "gemini-
 # --- Learning constants (overridable via settings table at runtime) ------------
 DEFAULT_NEW_CARDS_PER_DAY = 10
 DEFAULT_MORNING_PUSH = "09:00"
+DEFAULT_MIDDAY_PUSH = "14:00"
 DEFAULT_EVENING_PUSH = "20:00"
 DEFAULT_LESSON_TIME = "17:00"
 

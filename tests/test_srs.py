@@ -22,11 +22,25 @@ def test_good_three_times_grows_interval():
         st = srs.rate(rating="good", today=TODAY, **card)
         intervals.append(st.interval)
         card = {"interval": st.interval, "ease_factor": st.ease_factor, "repetitions": st.repetitions}
-    # First Good -> 1d, second -> 6d, third -> 6 * ease (~15d): strictly growing.
-    assert intervals[0] == 1
-    assert intervals[1] == 6
+    # First Good graduates to its step (3d); thereafter it grows by the ease factor.
+    assert intervals[0] == srs.GRADUATING_INTERVALS["good"]
+    assert intervals[1] > intervals[0]
     assert intervals[2] > intervals[1]
     assert intervals == sorted(intervals)
+
+
+def test_new_card_ratings_are_distinct():
+    # Regression for the "everything says (1d)" confusion: a brand-new card's
+    # four buttons must map to four different next-review dates.
+    card = _new()
+    by_rating = {
+        r: srs.rate(rating=r, today=TODAY, **card).interval
+        for r in ("again", "hard", "good", "easy")
+    }
+    assert by_rating["again"] == 0  # due again today
+    assert by_rating["hard"] < by_rating["good"] < by_rating["easy"]
+    # All four are genuinely different values.
+    assert len(set(by_rating.values())) == 4
 
 
 def test_again_resets():

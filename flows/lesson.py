@@ -65,6 +65,11 @@ async def handle_text(update: Update, context: ContextTypes.DEFAULT_TYPE) -> Non
     summary = result.get("summary", "").strip()
     cards = result.get("cards", [])
     added = db.add_cards([(c["front"], c["back"]) for c in cards], source="lesson") if cards else 0
+    # Bank the teacher's corrections into the mistake-pattern engine (vocab cards
+    # carry no category and are skipped).
+    for c in cards:
+        if c.get("kind") == "correction" and c.get("category"):
+            db.log_mistake(c["category"], c.get("front", ""), source="lesson")
 
     out = []
     if summary:

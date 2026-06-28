@@ -15,6 +15,13 @@ from datetime import date, timedelta
 
 START_EASE = 2.5
 MIN_EASE = 1.3
+EASY_BONUS = 1.3       # extra stretch an "Easy" rating gets over "Good"
+HARD_MULTIPLIER = 1.2  # "Hard" grows slowly instead of by the full ease factor
+
+# First interval (days) for each passing rating on a brand-new card (reps == 0).
+# These are deliberately *different* so the four buttons never collapse to the
+# same "(1d)" -- a new card now reads Again(today) / Hard(1d) / Good(3d) / Easy(7d).
+GRADUATING_INTERVALS = {"hard": 1, "good": 3, "easy": 7}
 
 # Rating -> SM-2 quality (0-5 scale).
 QUALITY = {"again": 2, "hard": 3, "good": 4, "easy": 5}
@@ -57,14 +64,18 @@ def rate(
         is_lapse = True
     else:
         if reps == 0:
-            new_interval = 1
-        elif reps == 1:
-            new_interval = 6
-        elif rating == "hard":
-            # Hard: grow slowly rather than by the full ease factor.
-            new_interval = max(1, round(interval * 1.2))
+            # Graduating step: a brand-new card's four ratings must give visibly
+            # different "next review" dates, otherwise Hard/Good/Easy all show 1d
+            # and the buttons look meaningless.
+            new_interval = GRADUATING_INTERVALS[rating]
         else:
-            new_interval = max(1, round(interval * ef))
+            base = interval if interval > 0 else 1
+            if rating == "hard":
+                new_interval = max(1, round(base * HARD_MULTIPLIER))
+            elif rating == "easy":
+                new_interval = max(1, round(base * ef * EASY_BONUS))
+            else:  # good
+                new_interval = max(1, round(base * ef))
         reps += 1
 
     # Update the ease factor with the standard SM-2 formula, floored at 1.3.
